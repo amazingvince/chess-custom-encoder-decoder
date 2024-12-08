@@ -1,0 +1,7 @@
+torch
+transformers
+accelerate
+datasets
+wandb
+chess
+CairoSVG
