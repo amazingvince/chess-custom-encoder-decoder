@@ -242,72 +242,51 @@ class MoveDecoder(nn.Module):
         return logits
 
 
+# In modeling_chess_encoder_decoder.py
 class ChessModel(PreTrainedModel):
     config_class = ChessModelConfig
-    
     def __init__(self, config):
         super().__init__(config)
         self.config = config
-        
         self.fen_encoder = FenEncoder(config)
         self.prefix_projector = PrefixProjector(config)
         self.move_decoder = MoveDecoder(config)
         self.regression_head = nn.Linear(config.hidden_size, 1)
-        
         self.post_init()
-        
+
     def forward(
         self,
         fen_input_ids,
         fen_attention_mask=None,
         decoder_input_ids=None,
-        decoder_attention_mask=None,
-        labels=None,
-        regression_labels=None,
-        regression_mask=None
+        decoder_attention_mask=None
     ):
         # Encode FEN
         encoder_hidden = self.fen_encoder(fen_input_ids, fen_attention_mask)
-        
         # Generate prefix states
         prefix_states = self.prefix_projector(encoder_hidden)
-        
         # Get regression predictions from encoder outputs
         regression_preds = self.regression_head(encoder_hidden.mean(dim=1))
-        
         # Decode moves with prefix
-        logits = self.move_decoder(
-            decoder_input_ids,
-            prefix_states,
-            decoder_attention_mask
-        )
+        logits = self.move_decoder(decoder_input_ids, prefix_states, decoder_attention_mask)
         
-        loss = None
-        if labels is not None:
-            loss = self.calculate_loss(logits, labels, pad_token_id=-100)
-            
-            # Compute regression loss only on analysis samples (where regression_mask == 1)
-            if regression_labels is not None and self.config.use_regression and regression_mask is not None:
-                # Compute MSELoss without reduction
-                mse_loss = (regression_preds.squeeze(-1) - regression_labels)**2
-                # Mask out non-analysis samples
-                mse_loss = mse_loss * regression_mask
-                # Average only over analysis samples
-                masked_regression_loss = mse_loss.sum() / (regression_mask.sum() + 1e-8)
-                loss = loss + masked_regression_loss
-        
+        # Return only predictions, no loss
         return {
-            "loss": loss,
             "logits": logits,
             "regression_preds": regression_preds
         }
 
     @staticmethod
-    def calculate_loss(logits, labels, pad_token_id=-100):
-        # Shape: [batch_size, seq_length, vocab_size]
+    def calculate_decoder_loss(logits, labels, pad_token_id=-100):
         loss_fct = CrossEntropyLoss(ignore_index=pad_token_id, reduction='sum')
-        # Reshape logits to [batch_size * seq_length, vocab_size]
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-        return loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
-                    shift_labels.view(-1))
+        return loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    @staticmethod
+    def calculate_regression_loss(regression_preds, regression_labels, regression_mask):
+        # Compute MSE only for masked positions
+        mse = (regression_preds.squeeze(-1) - regression_labels) ** 2
+        mse = mse * regression_mask
+        denom = regression_mask.sum() + 1e-8
+        return mse.sum() / denom

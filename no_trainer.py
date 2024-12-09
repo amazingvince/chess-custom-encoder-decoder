@@ -273,65 +273,67 @@ def main():
 
     for step, batch in enumerate(train_dataloader, start=1):
         model.train()
-        
-        # Validate batch
+
         if not validate_batch(batch):
             print(f"Invalid batch at step {step}")
             continue
-        
-        # Forward pass
+
+        # Forward pass (no loss computed by the model)
         outputs = model(
             fen_input_ids=batch["fen_input_ids"],
             fen_attention_mask=batch["fen_attention_mask"],
             decoder_input_ids=batch["decoder_input_ids"],
-            decoder_attention_mask=batch["decoder_attention_mask"],
-            labels=batch["labels"],
-            regression_labels=batch.get("regression_labels"),
-            regression_mask=batch.get("regression_mask")
+            decoder_attention_mask=batch["decoder_attention_mask"]
         )
-        
-        loss = outputs["loss"]
 
+        logits = outputs["logits"]
+        regression_preds = outputs["regression_preds"]
+
+        # Compute decoder loss
+        decoder_loss = model.calculate_decoder_loss(logits, batch["labels"], pad_token_id=-100)
+
+        # Compute regression loss if we have regression data
+        regression_loss = torch.tensor(0.0, device=logits.device)
+        if "regression_labels" in batch and "regression_mask" in batch and model.config.use_regression:
+            regression_loss = model.calculate_regression_loss(
+                regression_preds, batch["regression_labels"], batch["regression_mask"]
+            )
+
+        # Combine losses
+        loss = decoder_loss + (model.config.regression_weight * regression_loss)
+
+        # Handle non-finite loss
         if not torch.isfinite(loss):
             print(f"Warning: Non-finite loss detected: {loss.item()}")
             optimizer.zero_grad()
             continue
 
         accelerator.backward(loss)
-        
-        # Check gradient norms
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
-        if grad_norm > grad_clip_value:
-            print(f"Gradient norm: {grad_norm} exceeds clip value")
 
-        # Skip step if gradients are zero
+        # Gradient clipping
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
         if grad_norm < 1e-8:
             print("Warning: Gradient norm near zero")
             continue
 
-        # Clip gradients
-        if grad_clip_value > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
-        
-        # Log every 10 steps
-        if step % 10 == 0:
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+
+        # Logging
+        if step % log_freq == 0:
             grad_stats = log_gradient_stats(model)
             with torch.no_grad():
-                pred_moves, true_moves = decode_chess_moves(
-                    outputs["logits"], batch["labels"], tokenizer
-                )
-            
+                pred_moves, true_moves = decode_chess_moves(logits, batch["labels"], tokenizer)
             log_training_step(step, loss.item(), grad_stats, pred_moves, true_moves)
-            
-            # Update metrics
+
             metrics.update(
                 train_losses=loss.item(),
+                regression_losses=regression_loss.item(),
                 learning_rates=optimizer.param_groups[0]['lr']
             )
-        
 
-        
-        # Evaluate periodically
+        # Periodic evaluation
         if step % eval_every == 0:
             eval_metrics = evaluate_detailed(model, eval_dataloader, accelerator, tokenizer)
             accelerator.print(
@@ -341,7 +343,6 @@ def main():
                 f"Regression Loss: {eval_metrics.get('reg_loss', 'N/A')}"
             )
 
-            # Save checkpoint (only on process 0)
             if accelerator.is_main_process:
                 os.makedirs(output_dir, exist_ok=True)
                 accelerator.print(f"Saving model at step {step}")

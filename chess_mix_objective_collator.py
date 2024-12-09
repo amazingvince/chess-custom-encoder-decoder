@@ -1,7 +1,7 @@
-import torch
 from dataclasses import dataclass
 from typing import List, Dict, Any
-
+import torch
+import chess
 from chess_tokenizer import ChessTokenizer
 
 @dataclass
@@ -9,9 +9,10 @@ class MixedDataCollator:
     tokenizer: "ChessTokenizer"
     max_moves: int = 50
     use_regression: bool = True
+    debug: bool = True  # Set to True to enable debug printing
 
     def get_moves(self, example: Dict[str, Any]) -> List[str]:
-        """Helper method to get moves regardless of key case"""
+        """Return a list of move strings regardless of the key format."""
         if "Moves" in example:  # For puzzles and full games
             moves = example["Moves"]
             if isinstance(moves, str):
@@ -24,12 +25,32 @@ class MixedDataCollator:
             return line
         return []
 
+    def apply_moves_to_board(self, fen: str, moves: List[str], skip_count: int) -> str:
+        """Apply `skip_count` moves to the board starting from `fen` and return the resulting fen."""
+        board = chess.Board(fen)
+        for move_str in moves[:skip_count]:
+            move = chess.Move.from_uci(move_str)
+            if move not in board.legal_moves:
+                # If the move is somehow illegal given the fen, break or handle error
+                # For safety, just break, but ideally your data should be consistent.
+                break
+            board.push(move)
+        return board.fen()
+
+    def debug_print_batch(self, examples: List[Dict[str, Any]], moves_list: List[List[str]]):
+        """Print debug information about the length of each sample in the batch."""
+        print("\nDebug: Sample Lengths")
+        for ex, moves in zip(examples, moves_list):
+            ex_type = ex.get("example_type", "unknown")
+            if ex_type in ["full_game", "puzzle"]:
+                print(f"Type: {ex_type}, Moves count: {len(moves)}")
+            else:
+                # For analysis or other types, just print a placeholder.
+                print(f"Type: {ex_type}, (not applicable)")
+
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if not examples:
             raise ValueError("Received empty examples list")
-        for i, ex in enumerate(examples):
-            if not ex:
-                raise ValueError(f"Example at index {i} is empty: {ex}")
 
         input_ids_list = []
         attention_mask_list = []
@@ -39,29 +60,71 @@ class MixedDataCollator:
         regression_labels_list = []
         regression_mask_list = []
 
+        all_subsequent_moves = []  # For debug
+
         for ex in examples:
             ex_type = ex.get("example_type")
             # Default FEN if none provided
-            fen = ex.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            fen_ids = self.tokenizer.encode_fen(fen)
+            original_fen = ex.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+            moves = self.get_moves(ex)
 
             if ex_type == "full_game":
-                moves = self.get_moves(ex)
-                if len(moves) > 0:
-                    start_idx = torch.randint(low=0, high=len(moves), size=()).item()
-                    subsequent_moves = moves[start_idx:start_idx+self.max_moves]
-                else:
+                p = torch.rand(1).item()
+                if len(moves) == 0:
+                    # No moves
                     subsequent_moves = []
+                    fen_used = original_fen
+                else:
+                    if p >= 0.7:
+                        # 70% of the time: use full game from start
+                        # Possibly truncated to max_moves
+                        subsequent_moves = moves[:self.max_moves] if len(moves) > self.max_moves else moves
+                        fen_used = original_fen
+                    else:
+                        # 30% of the time: randomly skip some initial portion of the game
+                        # skip_count from [1, len(moves)-1] if you want to ensure skipping at least one move
+                        # or [0, len(moves)] if you allow skipping zero moves occasionally.
+                        # Let's say skip_count >=1 for effect:
+                        skip_count = torch.randint(low=1, high=len(moves), size=()).item()
+                        fen_used = self.apply_moves_to_board(original_fen, moves, skip_count)
+                        subsequent_moves = moves[skip_count:skip_count+self.max_moves]
                 move_ids = self.tokenizer.encode_moves(subsequent_moves)
                 regression_val = None
 
             elif ex_type == "puzzle":
-                moves = self.get_moves(ex)
-                move_ids = self.tokenizer.encode_moves(moves)
+                # Just use all puzzle moves or truncated at max_moves
+                subsequent_moves = moves[:self.max_moves] if len(moves) > self.max_moves else moves
+                fen_used = original_fen
+                move_ids = self.tokenizer.encode_moves(subsequent_moves)
+
+                # Check if final position is checkmate
+                board = chess.Board(fen_used)
+                for m in subsequent_moves:
+                    board.push(chess.Move.from_uci(m))
+                ended_in_checkmate = board.is_checkmate()
+
                 regression_val = None
 
+                # Create decoder inputs & labels
+                if len(move_ids) > 0:
+                    decoder_input_ids = [self.tokenizer.bos_token_id] + move_ids
+                    labels = move_ids.copy()
+
+                    if ended_in_checkmate:
+                        # If final position is checkmate, add EOS token
+                        decoder_input_ids.append(self.tokenizer.eos_token_id)
+                        labels.append(self.tokenizer.eos_token_id)
+                else:
+                    # If no moves at all, just start and end token if checkmate, otherwise just bos?
+                    decoder_input_ids = [self.tokenizer.bos_token_id]
+                    labels = []
+                    if ended_in_checkmate:
+                        decoder_input_ids.append(self.tokenizer.eos_token_id)
+                        labels.append(self.tokenizer.eos_token_id)
+
             elif ex_type == "analysis":
-                moves = self.get_moves(ex)
+                subsequent_moves = moves
+                fen_used = original_fen
                 move_ids = self.tokenizer.encode_moves(moves)
                 cp = ex.get("cp", None)
                 mate = ex.get("mate", None)
@@ -73,40 +136,44 @@ class MixedDataCollator:
                         regression_val = cp if cp is not None else 0
                 else:
                     regression_val = None
-
-                # For analysis: no meaningful tokens should be evaluated by the decoder.
-                # We give the decoder a minimal input that does not produce a prediction loss.
-                decoder_input_ids = [self.tokenizer.bos_token_id]
-                labels = [-100]
-                # Only proceed to padding steps after we handle all tasks.
-
             else:
-                raise ValueError(f"Unknown example_type. Expected 'full_game', 'puzzle', or 'analysis', but got '{ex_type}'. Full example: {ex}")
+                raise ValueError(
+                    f"Unknown example_type. Expected 'full_game', 'puzzle', or 'analysis', got '{ex_type}'")
 
-            # Only analysis samples should contribute to regression. Others will have None and be masked out.
-            regression_labels_list.append(regression_val)
-            regression_mask_list.append(1.0 if (ex_type == "analysis" and regression_val is not None) else 0.0)
+            # Determine regression mask
+            is_analysis = (ex_type == "analysis") and (regression_val is not None)
+            regression_labels_list.append(regression_val if regression_val is not None else 0.0)
+            regression_mask_list.append(1.0 if is_analysis else 0.0)
 
-            # Encoder input: fen
+            # Encoder input (FEN) after adjustments
+            fen_ids = self.tokenizer.encode_fen(fen_used)
             encoder_input_ids = [self.tokenizer.bos_token_id] + fen_ids + [self.tokenizer.eos_token_id]
             encoder_attention_mask = [1]*len(encoder_input_ids)
 
-            # If this is not analysis, proceed with normal decoder handling
-            if ex_type != "analysis":
+            # Decoder input and labels
+            if ex_type == "analysis":
+                # Minimal decoder input for analysis
+                decoder_input_ids = [self.tokenizer.bos_token_id]
+                labels = [-100]
+            else:
+                # For puzzle/full_game
                 if len(move_ids) > 0:
                     decoder_input_ids = [self.tokenizer.bos_token_id] + move_ids + [self.tokenizer.eos_token_id]
                     labels = move_ids + [self.tokenizer.eos_token_id]
                 else:
-                    # If no moves, provide just start and end token to decoder and ignore for loss
+                    # No moves
                     decoder_input_ids = [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id]
                     labels = [self.tokenizer.eos_token_id]
 
+            # Append to batch lists
             input_ids_list.append(encoder_input_ids)
             attention_mask_list.append(encoder_attention_mask)
             decoder_input_ids_list.append(decoder_input_ids)
             decoder_attention_mask_list.append([1]*len(decoder_input_ids))
             labels_list.append(labels)
+            all_subsequent_moves.append(subsequent_moves)  # For debug
 
+        # Padding function
         def pad_seq(seqs, max_len, pad_id):
             return [seq + [pad_id]*(max_len - len(seq)) for seq in seqs]
 
@@ -119,7 +186,7 @@ class MixedDataCollator:
         padded_decoder_attention_mask = pad_seq(decoder_attention_mask_list, max_dec_len, 0)
         padded_labels = pad_seq(labels_list, max_dec_len, -100)
 
-        regression_targets = [0.0 if x is None else float(x) for x in regression_labels_list]
+        regression_targets = [float(x) for x in regression_labels_list]
 
         batch = {
             "fen_input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
@@ -133,5 +200,8 @@ class MixedDataCollator:
             batch["regression_labels"] = torch.tensor(regression_targets, dtype=torch.float)
             batch["regression_mask"] = torch.tensor(regression_mask_list, dtype=torch.float)
 
-        return batch
+        # Debug print
+        if self.debug:
+            self.debug_print_batch(examples, all_subsequent_moves)
 
+        return batch

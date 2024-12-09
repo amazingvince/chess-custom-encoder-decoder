@@ -194,18 +194,27 @@ def evaluate_detailed(model, dataloader, accelerator, tokenizer) -> Dict[str, fl
             if not validate_batch(batch):
                 print("Invalid batch encountered during evaluation")
                 continue
+
+            # accelerator.print(f"Batch: {batch}")
+
+            # accelerator.print(f"Batch size: {len(batch)}")
                 
             outputs = model(
                 fen_input_ids=batch["fen_input_ids"],
                 fen_attention_mask=batch["fen_attention_mask"],
                 decoder_input_ids=batch["decoder_input_ids"],
-                decoder_attention_mask=batch["decoder_attention_mask"],
-                labels=batch["labels"],
-                regression_labels=batch.get("regression_labels"),
-                regression_mask=batch.get("regression_mask")
+                decoder_attention_mask=batch["decoder_attention_mask"]
             )
-            
-            loss = outputs["loss"]
+
+            # Now manually compute losses:
+            decoder_loss = model.calculate_decoder_loss(outputs["logits"], batch["labels"])
+            regression_loss = torch.tensor(0.0, device=outputs["logits"].device)
+            if "regression_labels" in batch and "regression_mask" in batch and model.config.use_regression:
+                regression_loss = model.calculate_regression_loss(
+                    outputs["regression_preds"], batch["regression_labels"], batch["regression_mask"]
+                )
+
+            loss = decoder_loss + (model.config.regression_weight * regression_loss)
             logits = outputs["logits"]
             move_acc = calculate_move_accuracy(logits, batch["labels"])
             
