@@ -27,9 +27,7 @@ class MixedDataCollator:
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if not examples:
             raise ValueError("Received empty examples list")
-        
-        batch = super().__call__(examples)
-        
+                
         for i, ex in enumerate(examples):
             if not ex:
                 raise ValueError(f"Example at index {i} is empty: {ex}")
