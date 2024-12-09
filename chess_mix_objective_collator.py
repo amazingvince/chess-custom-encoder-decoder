@@ -27,7 +27,6 @@ class MixedDataCollator:
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if not examples:
             raise ValueError("Received empty examples list")
-                
         for i, ex in enumerate(examples):
             if not ex:
                 raise ValueError(f"Example at index {i} is empty: {ex}")
@@ -42,7 +41,6 @@ class MixedDataCollator:
 
         for ex in examples:
             ex_type = ex.get("example_type")
-
             # Default FEN if none provided
             fen = ex.get("fen", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
             fen_ids = self.tokenizer.encode_fen(fen)
@@ -70,11 +68,18 @@ class MixedDataCollator:
                 if self.use_regression:
                     if mate is not None:
                         # Large positive/negative value for mate
-                        regression_val = 100 if mate > 0 else -100
+                        regression_val = 40000 if mate > 0 else -40000
                     else:
                         regression_val = cp if cp is not None else 0
                 else:
                     regression_val = None
+
+                # For analysis: no meaningful tokens should be evaluated by the decoder.
+                # We give the decoder a minimal input that does not produce a prediction loss.
+                decoder_input_ids = [self.tokenizer.bos_token_id]
+                labels = [-100]
+                # Only proceed to padding steps after we handle all tasks.
+
             else:
                 raise ValueError(f"Unknown example_type. Expected 'full_game', 'puzzle', or 'analysis', but got '{ex_type}'. Full example: {ex}")
 
@@ -86,13 +91,15 @@ class MixedDataCollator:
             encoder_input_ids = [self.tokenizer.bos_token_id] + fen_ids + [self.tokenizer.eos_token_id]
             encoder_attention_mask = [1]*len(encoder_input_ids)
 
-            # Decoder input: moves
-            if len(move_ids) > 0:
-                decoder_input_ids = [self.tokenizer.bos_token_id] + move_ids + [self.tokenizer.eos_token_id]
-                labels = move_ids + [self.tokenizer.eos_token_id]
-            else:
-                decoder_input_ids = [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id]
-                labels = [self.tokenizer.eos_token_id]
+            # If this is not analysis, proceed with normal decoder handling
+            if ex_type != "analysis":
+                if len(move_ids) > 0:
+                    decoder_input_ids = [self.tokenizer.bos_token_id] + move_ids + [self.tokenizer.eos_token_id]
+                    labels = move_ids + [self.tokenizer.eos_token_id]
+                else:
+                    # If no moves, provide just start and end token to decoder and ignore for loss
+                    decoder_input_ids = [self.tokenizer.bos_token_id, self.tokenizer.eos_token_id]
+                    labels = [self.tokenizer.eos_token_id]
 
             input_ids_list.append(encoder_input_ids)
             attention_mask_list.append(encoder_attention_mask)
@@ -127,3 +134,4 @@ class MixedDataCollator:
             batch["regression_mask"] = torch.tensor(regression_mask_list, dtype=torch.float)
 
         return batch
+
