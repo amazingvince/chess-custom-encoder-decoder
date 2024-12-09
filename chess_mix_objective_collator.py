@@ -2,6 +2,8 @@ import torch
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
+from chess_tokenizer import ChessTokenizer
+
 @dataclass
 class MixedDataCollator:
     tokenizer: "ChessTokenizer"
@@ -25,6 +27,8 @@ class MixedDataCollator:
     def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if not examples:
             raise ValueError("Received empty examples list")
+        
+        batch = super().__call__(examples)
         
         for i, ex in enumerate(examples):
             if not ex:

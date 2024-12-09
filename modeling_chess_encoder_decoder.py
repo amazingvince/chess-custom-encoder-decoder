@@ -284,8 +284,7 @@ class ChessModel(PreTrainedModel):
         
         loss = None
         if labels is not None:
-            loss_fct = CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = self.calculate_loss(logits, labels, pad_token_id=-100)
             
             # Compute regression loss only on analysis samples (where regression_mask == 1)
             if regression_labels is not None and self.config.use_regression and regression_mask is not None:
@@ -302,3 +301,13 @@ class ChessModel(PreTrainedModel):
             "logits": logits,
             "regression_preds": regression_preds
         }
+
+    @staticmethod
+    def calculate_loss(logits, labels, pad_token_id=-100):
+        # Shape: [batch_size, seq_length, vocab_size]
+        loss_fct = CrossEntropyLoss(ignore_index=pad_token_id, reduction='sum')
+        # Reshape logits to [batch_size * seq_length, vocab_size]
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        return loss_fct(shift_logits.view(-1, shift_logits.size(-1)), 
+                    shift_labels.view(-1))

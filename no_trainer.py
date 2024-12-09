@@ -8,10 +8,13 @@ from chess_mix_objective_collator import MixedDataCollator
 from modeling_chess_encoder_decoder import ChessModel
 from configuration_chess_encoder_decoder import ChessModelConfig
 from datasets import load_dataset, interleave_datasets, Dataset
+from debugger import validate_batch, TrainingMetrics, evaluate_detailed, decode_chess_moves, log_gradient_stats, log_training_step
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
+
+metrics = TrainingMetrics()
 
 EXAMPLE_TYPES = {
     'FULL_GAME': 'full_game',
@@ -199,14 +202,14 @@ def main():
     config = ChessModelConfig(
         vocab_size=tokenizer.vocab_size(),
         use_regression=True,
-        hidden_size=1024,
-        num_attention_heads=16,
-        num_encoder_layers=14,
-        num_decoder_layers=32,
-        intermediate_size=4096,
-        hidden_act="silu",
-        prefix_length=32,
-        max_position_embeddings=200,
+        hidden_size=512,  # Reduced from 1024
+        num_attention_heads=8,  # Reduced from 16
+        num_encoder_layers=6,  # Reduced from 14
+        num_decoder_layers=6,  # Reduced from 32
+        intermediate_size=2048,  # Reduced from 4096
+        hidden_act="silu",  # Changed from silu
+        prefix_length=16,  # Reduced from 32
+        max_position_embeddings=256,  # Reduced from 200
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
@@ -214,7 +217,7 @@ def main():
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        regression_weight=1.0,
+        regression_weight=0.1,  # Reduced weight for regression loss
     )
     model = ChessModel(config)
 
@@ -224,11 +227,20 @@ def main():
         use_regression=True
     )
 
+
+    # Add logging frequency parameters
+    log_freq = 10  # Log every 10 steps
+    batch_inspect_freq = 100  # Detailed batch inspection every 100 steps
+    grad_clip_value = 1.0  # Add gradient clipping
+
+
     # Hyperparameters
-    learning_rate = 1e-4
-    max_steps = 1000
-    warmup_steps = 100
-    batch_size = 8
+    learning_rate = 5e-4  # Increased from 1e-4
+    warmup_steps = 1000  # Increased from 100
+    max_steps = 50000  # Increased from 1000
+    batch_size = 32  # Increased from 8
+    grad_clip_value = 1.0
+    weight_decay = 0.01
     eval_every = 100
     output_dir = "./checkpoints"
 
@@ -236,7 +248,12 @@ def main():
     train_dataloader, eval_dataloader, _ = create_dataloaders(tokenizer, data_collator, batch_size=batch_size, max_steps=max_steps)
 
     # Optimizer and Scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                    lr=learning_rate,
+                                    weight_decay=weight_decay,
+                                    betas=(0.9, 0.999),
+                                    eps=1e-8
+                                )
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
@@ -255,33 +272,74 @@ def main():
     model.train()
 
     for step, batch in enumerate(train_dataloader, start=1):
+        model.train()
+        
+        # Validate batch
+        if not validate_batch(batch):
+            print(f"Invalid batch at step {step}")
+            continue
+        
         # Forward pass
         outputs = model(
             fen_input_ids=batch["fen_input_ids"],
             fen_attention_mask=batch["fen_attention_mask"],
             decoder_input_ids=batch["decoder_input_ids"],
             decoder_attention_mask=batch["decoder_attention_mask"],
-            labels=batch["labels"],  # Ensure that 'labels' is included in the batch
-            regression_labels=batch.get("regression_labels", None),
-            regression_mask=batch.get("regression_mask", None)
+            labels=batch["labels"],
+            regression_labels=batch.get("regression_labels"),
+            regression_mask=batch.get("regression_mask")
         )
+        
+        loss = outputs["loss"]
 
-        loss = outputs["loss"]  # Access the loss from the dictionary
+        if not torch.isfinite(loss):
+            print(f"Warning: Non-finite loss detected: {loss.item()}")
+            optimizer.zero_grad()
+            continue
 
         accelerator.backward(loss)
+        
+        # Check gradient norms
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+        if grad_norm > grad_clip_value:
+            print(f"Gradient norm: {grad_norm} exceeds clip value")
 
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
+        # Skip step if gradients are zero
+        if grad_norm < 1e-8:
+            print("Warning: Gradient norm near zero")
+            continue
 
+        # Clip gradients
+        if grad_clip_value > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
+        
+        # Log every 10 steps
         if step % 10 == 0:
-            accelerator.print(f"Step {step}/{max_steps}, Loss: {loss.item():.10f}")
-            accelerator.log({"train_loss": loss}, step=global_step)
+            grad_stats = log_gradient_stats(model)
+            with torch.no_grad():
+                pred_moves, true_moves = decode_chess_moves(
+                    outputs["logits"], batch["labels"], tokenizer
+                )
+            
+            log_training_step(step, loss.item(), grad_stats, pred_moves, true_moves)
+            
+            # Update metrics
+            metrics.update(
+                train_losses=loss.item(),
+                learning_rates=optimizer.param_groups[0]['lr']
+            )
+        
 
+        
+        # Evaluate periodically
         if step % eval_every == 0:
-            eval_loss = evaluate(model, eval_dataloader, accelerator)
-            accelerator.print(f"Step {step}: Eval Loss: {eval_loss:.10f}")
-            accelerator.log({"eval_loss": loss}, step=global_step)
+            eval_metrics = evaluate_detailed(model, eval_dataloader, accelerator, tokenizer)
+            accelerator.print(
+                f"\nEvaluation at step {step}:\n"
+                f"Loss: {eval_metrics['eval_loss']:.6f}\n"
+                f"Move Accuracy: {eval_metrics['move_accuracy']:.4f}\n"
+                f"Regression Loss: {eval_metrics.get('reg_loss', 'N/A')}"
+            )
 
             # Save checkpoint (only on process 0)
             if accelerator.is_main_process:
