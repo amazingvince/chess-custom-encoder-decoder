@@ -84,12 +84,6 @@ The system employs multi-task learning with two distinct objectives:
 
 ## Data Sources
 
-# Chess AI System Overview
-
-[Previous sections remain the same until Data Sources]
-
-## Data Sources
-
 ### Lichess Standard Games Dataset
 
 Primary source for strategic move prediction and ELO-based training:
